@@ -5,3 +5,65 @@ from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 
 # (1) 모델 불러오기
+def get_model_instance_segmentation(num_classes) :
+    model = fasterrcnn_resnet50_fpn(pretrained=True)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+save_path = "/content/drive/MyDrive/dekopon_250212.pth"
+
+model = get_model_instance_segmentation(num_classes=7)
+
+# 저장된 파라미터 불러오기
+model.load_state_dict(torch.load(save_path))
+
+device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+model.to(device)
+model.eval() # 평가모드로 설정
+
+# (2) 모델 성능 중간 평가 (검증셋)
+# mAP 계산을 위한 객체 생성
+mAP_metric = MeanAveragePrecision()
+
+def evaluate_mAP(model, dataloader, threshold=0.5) :
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad() :
+        for images, targets in dataloader :
+            images = [img.to(device) for img in images]
+            outputs = model(images)
+
+            # 출력된 예측 & ground truth 값 -> torchmetrics 형식으로 변환
+            for i, output in enumerate(outputs) :
+                boxes = output['boxes'].cpu().numpy()
+                labels = output['labels'].cpu().numpy()
+                scores = output['scores'].cpu().numpy()
+
+                # 임계값 적용 : score가 threshold 이상인 예측만 사용하기
+                keep = scores >= threshold
+                boxes = boxes[keep]
+                labels = labels[keep]
+                scores = scores[keep]
+
+                gt_labels = targets[i]['labels'].cpu().numpy()
+
+                # 결과를 torchmetrics 형식으로 변환
+                all_preds.append({
+                    "boxes": torch.tensor(boxes),
+                    "scores": torch.tensor(scores),
+                    "labels": torch.tensor(labels)
+                })
+                all_labels.append({
+                    "boxes": torch.tensor(targets[i]['boxes'].cpu().numpy()),
+                    "labels": torch.tensor(gt_labels)
+                })
+
+    mAP_score = mAP_metric(all_preds, all_labels)
+    return mAP_score
+
+# mAP 계산
+mAP_score_val = evaluate_mAP(model, val_loader)
+print(f"Validation mAP: {mAP_score_val}")
