@@ -1,0 +1,258 @@
+# (1) 구글 드라이브 마운트
+from google.colab import drive
+drive.mount('/content/drive')
+
+# (2) 라이브러리 임포트
+import os
+import json
+import numpy as np
+import cv2
+import torch
+import torch.optim as optim
+import torchvision
+import torchmetrics
+import xml.etree.ElementTree as ET
+import torchvision.transforms as T
+import matplotlib.pyplot as plt
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+%matplotlib inline
+
+# (3) 사용자 정의 Dataset 클래스 구현
+# root (str) : XML 라벨링 파일과 이미지가 있는 폴더 경로
+# transforms (callable, optional) : 이미지 전처리 & 변환 함수
+# {"정상": 1, "총채벌레": 2, "healthy": 3, "canker": 4, "spot": 5, "citrus miner": 6}
+class CustomDataset(Dataset) :
+
+    def __init__(self, root, transforms=None, classes_mapping=None) :
+        self.root = root
+        self.transforms = transforms
+        self.xml_files = [os.path.join(root, f) for f in os.listdir(root) if f.endswith('.xml')]
+
+        if classes_mapping is None :
+            self.classes_mapping = {
+                "정상": 1,
+                "총채벌레": 2,
+                "healthy": 3,
+                "canker": 4,
+                "spot": 5,
+                "citrus miner": 6
+            }
+        else :
+            self.classes_mapping = classes_mapping
+
+    def __len__(self) :
+        return len(self.xml_files)
+
+    def __getitem__(self, idx) :
+        xml_path = self.xml_files[idx]
+        tree = ET.parse(xml_path)
+        root_elem = tree.getroot()
+
+        # 이미지 파일명 추출
+        image_file = root_elem.find('filename').text.strip()
+        # 이미지 파일 : XML 파일과 같은 폴더 내에 있다고 가정
+        img_path = os.path.join(self.root, image_file)
+        img = Image.open(img_path).convert("RGB")
+
+        boxes = []
+        labels = []
+        # XML 파일의 모든 object 태그 처리 (객체마다 바운딩 박스 & 클래스 정보)
+        for obj in root_elem.findall('object') :
+            name = obj.find('name').text.strip()
+            label_val = self.classes_mapping.get(name, 0)
+            labels.append(label_val)
+
+            bndbox = obj.find('bndbox')
+            xmin = int(bndbox.find('xmin').text)
+            ymin = int(bndbox.find('ymin').text)
+            xmax = int(bndbox.find('xmax').text)
+            ymax = int(bndbox.find('ymax').text)
+            boxes.append([xmin, ymin, xmax, ymax])
+
+        boxes = torch.as_tensor(boxes, dtype=torch.float32)
+        labels = torch.as_tensor(labels, dtype=torch.int64)
+
+        image_id = torch.tensor([idx])
+        area = (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0])
+        iscrowd = torch.zeros((boxes.shape[0],), dtype=torch.int64)
+
+        target = {
+            "boxes" : boxes,
+            "labels" : labels,
+            "image_id" : image_id,
+            "area" : area,
+            "iscrowd" : iscrowd
+        }
+
+        if self.transforms :
+            img = self.transforms(img)
+
+        return img, target
+
+# 변환 함수 설정 (학습 시와 검증/테스트 시 차이가 있을 수 있다.)
+def get_transform(train) :
+    transforms = []
+    transforms.append(T.ToTensor())
+    if train :
+        transforms.append(T.RandomHorizontalFlip(0.5))
+    return T.Compose(transforms)
+
+# 각 데이터셋 폴더 경로 설정
+train_path = "/content/drive/MyDrive/data/train"
+val_path   = "/content/drive/MyDrive/data/validation"
+test_path  = "/content/drive/MyDrive/data/test"
+
+dataset_train = CustomDataset(train_path, transforms=get_transform(train=True))
+dataset_val   = CustomDataset(val_path, transforms=get_transform(train=False))
+dataset_test  = CustomDataset(test_path, transforms=get_transform(train=False))
+
+# DataLoader 생성 (object detection 모델 : collate_fn 필요)
+def collate_fn(batch) :
+    return tuple(zip(*batch))
+
+train_loader = DataLoader(dataset_train, batch_size=8, shuffle=True, num_workers=2, collate_fn=collate_fn)
+val_loader   = DataLoader(dataset_val, batch_size=8, shuffle=False, num_workers=2, collate_fn=collate_fn)
+test_loader  = DataLoader(dataset_test, batch_size=8, shuffle=False, num_workers=2, collate_fn=collate_fn)
+
+# train_loader의 첫 배치에서 이미지와 타겟 정보 확인
+images, targets = next(iter(train_loader))
+print(f"Batch image type: {type(images[0])}, Batch target type: {type(targets[0])}")
+
+# (4) torchvision의 사전학습된 Faster R-CNN 모델(ResNet-50 FPN 기반) 불러오기
+def get_model_instance_segmentation(num_classes) :
+    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
+    in_features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
+    return model
+
+# 클래스 매핑
+num_classes = 7
+model = get_model_instance_segmentation(num_classes)
+model.to(torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
+
+# (5) 옵티마이저 및 학습
+# 옵티마이저 & learning rate scheduler 설정
+optimizer = optim.SGD(model.parameters(), lr=0.005, momentum=0.9, weight_decay=0.0005)
+lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+checkpoint_path = "/content/drive/MyDrive/model/dekopon_250220_epoch_97.pth"
+
+start_epoch = 0  # 기본적으로는 처음부터 학습
+if os.path.exists(checkpoint_path) :
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
+    start_epoch = checkpoint["epoch"]  # 마지막 저장된 에포크부터 시작하기
+    print(f"{start_epoch} 에포크부터 학습이 재개됩니다.")
+else:
+    print("체크포인트를 찾지 못했습니다. 학습이 처음부터 시작됩니다.")
+
+# 총 학습 에포크
+num_epochs = 100
+
+for epoch in range(start_epoch, num_epochs) :
+    # 학습
+    model.train()
+    train_loss_total = 0.0
+
+    for images, targets in train_loader :
+        images = [img.to(device) for img in images]
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        optimizer.zero_grad()
+        loss_dict = model(images, targets)
+        losses = sum(loss for loss in loss_dict.values())
+        train_loss_total += losses.item()
+
+        losses.backward()
+        optimizer.step()
+
+    avg_train_loss = train_loss_total / len(train_loader)
+
+    # 검증
+    model.train()
+    val_loss_total = 0.0
+    with torch.no_grad() :
+        for images, targets in val_loader :
+            images = [img.to(device) for img in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            val_loss_total += losses.item()
+
+    avg_val_loss = val_loss_total / len(val_loader)
+
+    print(f"에포크 {epoch+1}/{num_epochs}  -  학습 loss: {avg_train_loss:.4f}  /  검증 loss: {avg_val_loss:.4f}")
+
+    # learning rate scheduler 업데이트
+    lr_scheduler.step()
+
+    # 모델 + 옵티마이저 + 학습률 스케줄러 - 같이 저장
+    checkpoint_path = f"/content/drive/MyDrive/model/dekopon_250220_epoch_{epoch+1}.pth"
+    torch.save({
+        "epoch": epoch + 1,  # 다음 에포크부터 시작할 수 있게
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "lr_scheduler_state_dict": lr_scheduler.state_dict()
+    }, checkpoint_path)
+
+    print(f"{epoch+1} 에포크의 모델+옵티마이저+학습률 스케줄러가 저장되었습니다.: {checkpoint_path}")
+
+print("! 훈련 종료 !")
+
+# (6) 모델 성능 중간 평가 (검증셋)
+# mAP 계산 -> torchmetrics metric 사용
+
+# 모델을 평가 모드로 설정
+model.eval()
+
+mAP_metric = MeanAveragePrecision()
+
+# 평가
+def evaluate_mAP(model, dataloader, threshold=0.5) :
+    model.eval()
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad() :
+        for images, targets in dataloader:
+            images = [img.to(device) for img in images]
+            outputs = model(images)
+
+            # 출력된 예측 & ground truth 값을 torchmetrics 형식으로 변환
+            for i, output in enumerate(outputs) :
+                # (boxes, labels, scores) 형태로 리스트 준비
+                boxes = output['boxes'].cpu().numpy()
+                labels = output['labels'].cpu().numpy()
+                scores = output['scores'].cpu().numpy()
+
+                # 임계값 적용 : score가 threshold 이상인 예측만 사용하기
+                keep = scores >= threshold
+                boxes = boxes[keep]
+                labels = labels[keep]
+                scores = scores[keep]
+
+                gt_labels = targets[i]['labels'].cpu().numpy()
+
+                # 결과를 torchmetrics 형식으로 변환
+                all_preds.append({
+                    "boxes": torch.tensor(boxes),
+                    "scores": torch.tensor(scores),
+                    "labels": torch.tensor(labels)
+                })
+                all_labels.append({
+                    "boxes": torch.tensor(targets[i]['boxes'].cpu().numpy()),
+                    "labels": torch.tensor(gt_labels)
+                })
+
+    mAP_score = mAP_metric(all_preds, all_labels)
+    return mAP_score
+
+# mAP 계산
+mAP_score_val = evaluate_mAP(model, val_loader)
+print(f"Validation mAP: {mAP_score_val}")
