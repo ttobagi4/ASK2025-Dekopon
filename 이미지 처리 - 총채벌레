@@ -1,0 +1,213 @@
+# (1) 이미지 전처리 - 크기 조정 & HSV 색 공간 변환
+def preprocess_image(image_path) :
+    image = cv2.imread(image_path)
+    if image is None :
+        raise ValueError(f"이미지를 불러올 수 없습니다.: {image_path}")
+    resized_image = cv2.resize(image, (512, 512))
+    hsv_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2HSV)
+    return resized_image, hsv_image
+
+# (2) Blur 기반 마스크 생성 - 흐린 부분 배경으로 판단하여 제거
+def create_blur_mask(image) :
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gaussian = cv2.GaussianBlur(gray, (5, 5), 0)
+    laplacian = cv2.Laplacian(gaussian, cv2.CV_64F)  # 라플라시안 필터
+    laplacian_abs = cv2.convertScaleAbs(laplacian)
+    laplacian_abs = cv2.GaussianBlur(laplacian_abs, (7, 7), 0)  # 블러 재적용
+    _, blur_mask = cv2.threshold(laplacian_abs, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)  # OTSU 처리
+    return blur_mask
+
+# (3) 과실 영역 검출 - 중앙을 중심으로 원형 마스크 생성
+# 평균 H 값 기반으로 과실 색상 분류 (3가지)
+def detect_fruit_area(image, hsv_image) :
+    height, width = image.shape[:2]  # 이미지 크기 정보
+    center = (width // 2, height // 2)  # 중심 좌표
+    radius = int(min(width, height) * 0.46)  # 과실 영역 반지름 설정
+    circle_mask = np.zeros((height, width), dtype=np.uint8)  # 원형 마스크 생성
+    cv2.circle(circle_mask, center, radius, 255, -1)
+
+    lower_orange = np.array([10, 100, 100])
+    upper_orange = np.array([40, 255, 255])
+    mask_orange = cv2.inRange(hsv_image, lower_orange, upper_orange)  # 오렌지색 필터 적용
+
+    blur_mask = create_blur_mask(image)  # 블러 마스크 생성
+    blur_mask = cv2.morphologyEx(blur_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7)))
+    blur_mask = cv2.resize(blur_mask, (mask_orange.shape[1], mask_orange.shape[0]))
+    blur_mask = blur_mask.astype(np.uint8)
+
+    # 과실 평균 H 값 계산 (원형 마스크 내부)
+    mean_hue = np.mean(hsv_image[:, :, 0][circle_mask > 0])
+
+    # 과실 색상 구분 (Yellow / Yellowish Green / Green)
+    if mean_hue <= 29 :
+        fruit_color = 'Yellow'
+    elif mean_hue <= 35 :
+        fruit_color = 'Yellowish Green'
+    else :
+        fruit_color = 'Green'
+
+    # 과실 색상에 따른 마스크 가중치 조정
+    if fruit_color == 'Yellow' :
+        hsv_weight, blur_weight, circle_weight = 0.8, 0.1, 0.1  # 노란색 과실일 경우
+    else :
+        hsv_weight, blur_weight, circle_weight = 0.2, 0.6, 0.2
+
+    # 가중치를 적용 -> 최종 마스크 생성
+    mask_combined = cv2.addWeighted(mask_orange, hsv_weight, blur_mask, blur_weight, 0)
+    mask_combined = cv2.addWeighted(mask_combined, 1.0, circle_mask, circle_weight, 0)
+    mask_combined = cv2.bitwise_and(mask_combined, circle_mask)
+
+    grabcut_mask = np.zeros(image.shape[:2], np.uint8)
+    grabcut_mask[mask_combined > 0] = 1  # 과실 영역 설정
+    grabcut_mask[mask_combined == 0] = 2  # 배경 설정
+
+    bgd_model = np.zeros((1,65), np.float64)  # GrabCut 배경 모델
+    fgd_model = np.zeros((1,65), np.float64)  # GrabCut 전경 모델
+    cv2.grabCut(image, grabcut_mask, None, bgd_model, fgd_model, iterCount=5, mode=cv2.GC_INIT_WITH_MASK)
+
+    final_mask = np.where((grabcut_mask==2) | (grabcut_mask==0), 0, 1).astype("uint8")  # 최종 마스크
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+    mask_cleaned = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)  # 노이즈 제거
+
+    contours, _ = cv2.findContours(mask_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  # 과실 윤곽선 검출
+    if contours :
+        contours = [max(contours, key=cv2.contourArea)]  # 가장 큰 윤곽선 선택
+
+    mean_hue_final = np.mean(hsv_image[:, :, 0][mask_cleaned > 0])  # 과실 내부 평균 H 값 계산
+
+    return contours, mask_cleaned, fruit_color, mean_hue_final
+
+# (4) 병징 영역 검출 - 평균 H 값과 차이가 큰 영역 -> 병징으로 탐지
+def detect_disease_area(hsv_image, fruit_mask, fruit_color) :
+    mean_h_inside = np.mean(hsv_image[:, :, 0][fruit_mask > 0])  # 과실 내부 평균 H값 계산
+    diff_threshold = 3  # H 값 차이 기준
+    diff_mask = np.abs(hsv_image[:, :, 0].astype(np.float32) - mean_h_inside) > diff_threshold  # 평균 H값과 차이가 큰 영역 찾기
+    lower_condition = hsv_image[:, :, 0] < mean_h_inside  # 평균보다 낮은 H 값만 유지
+    diff_mask = np.logical_and(diff_mask, lower_condition)
+    v_condition = hsv_image[:, :, 2] < 200  # 명도(V)가 200 미만인 영역만 유지
+    diff_mask = np.logical_and(diff_mask, v_condition)
+
+    h_condition = (hsv_image[:, :, 0] >= 27) & (hsv_image[:, :, 0] <= 35)  # 특정 H 범위 설정
+    s_condition = hsv_image[:, :, 1] >= 150  # 특정 S 범위 설정
+    exclusion_mask1 = np.logical_and(h_condition, s_condition)  # 병징 제외 마스크 생성
+
+    exclusion_mask2 = hsv_image[:, :, 0] >= 33  # H 값이 33 이상이면 병징에서 제외
+    exclusion_mask = np.logical_or(exclusion_mask1, exclusion_mask2)  # 최종 제외 마스크 생성
+    diff_mask = np.logical_and(diff_mask, ~exclusion_mask)  # 병징 제외 영역 제거
+
+    diff_mask = diff_mask.astype("uint8") * 255
+
+    sobelx = cv2.Sobel(hsv_image[:, :, 0].astype(np.float32), cv2.CV_64F, 1, 0, ksize=3)  # X 방향 기울기 계산
+    sobely = cv2.Sobel(hsv_image[:, :, 0].astype(np.float32), cv2.CV_64F, 0, 1, ksize=3)  # Y 방향 기울기 계산
+    grad_mag = np.sqrt(sobelx**2 + sobely**2)  # 그래디언트 크기 계산
+    grad_threshold = 8  # 그래디언트 임계값 설정
+    grad_mask = grad_mag > grad_threshold  # 그래디언트 필터 적용
+    diff_mask = np.logical_and(diff_mask, grad_mask)  # 그래디언트 필터 + 병징 마스크
+    diff_mask = diff_mask.astype("uint8") * 255
+
+    if fruit_color == 'Yellow' :
+        h_threshold = 18  # 노란색 과실의 H 필터 기준
+    elif fruit_color == 'Yellowish Green' :
+        h_threshold = 21  # 연두색(황록색) 과실의 H 필터 기준
+    else :
+        h_threshold = 30  # 녹색 과실의 H 필터 기준
+
+    mask_h = (hsv_image[:, :, 0] <= h_threshold).astype("uint8") * 255  # H 필터 마스크 생성
+
+    mask_thrips = cv2.bitwise_or(mask_h, diff_mask)  # H 필터 + 병징 마스크
+    mask_thrips = cv2.bitwise_and(mask_thrips, fruit_mask)  # 과실 영역 내에서만 병징 탐지
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    mask_thrips = cv2.morphologyEx(mask_thrips, cv2.MORPH_CLOSE, kernel)  # 노이즈 제거
+
+    contours, _ = cv2.findContours(mask_thrips, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  # 병징 윤곽선 검출
+    return contours, mask_thrips, mask_h, diff_mask
+
+# (5) 병징 면적 분석 - 과실 면적 대비 백분율 계산
+def analyze_disease(contours_disease_all, fruit_area_mask, hsv_image) :
+    fruit_area = np.sum(fruit_area_mask > 0)  # 과실 면적 계산
+    if fruit_area == 0 :
+        return None
+
+    mask_disease_contours = np.zeros_like(fruit_area_mask, dtype=np.uint8)  # 병징 마스크 생성
+    cv2.drawContours(mask_disease_contours, contours_disease_all, -1, (255), thickness=cv2.FILLED)
+
+    total_disease_pixels = np.sum(mask_disease_contours > 0)  # 병징 영역 픽셀 수 계산
+    if total_disease_pixels == 0 :
+        return 0
+
+    disease_ratio = (total_disease_pixels / fruit_area) * 100  # 병징 면적 비율 계산
+    return disease_ratio
+
+# (6) 시각화
+def visualize_results(image, contours_fruit, contours_disease) :
+    result_image = image.copy()
+    cv2.drawContours(result_image, contours_fruit, -1, (0,255,0), thickness=3)  # 과실 윤곽선 그리기
+    cv2.drawContours(result_image, contours_disease, -1, (0,0,255), thickness=3)  # 병징 윤곽선 그리기
+    return result_image
+
+# 실행
+def main(image_path) :
+    resized_image, hsv_image = preprocess_image(image_path)  # 이미지 전처리
+    contours_fruit, fruit_mask, fruit_color, mean_hue = detect_fruit_area(resized_image, hsv_image)  # 과실 탐지
+    contours_disease, disease_mask, mask_h, diff_mask = detect_disease_area(hsv_image, fruit_mask, fruit_color)  # 병징 탐지
+    result_visualization = visualize_results(resized_image, contours_fruit, contours_disease)  # 결과 시각화
+
+    lower_orange = np.array([10, 100, 100])
+    upper_orange = np.array([40, 255, 255])
+    mask_hsv = cv2.inRange(hsv_image, lower_orange, upper_orange)
+
+    blur_mask = create_blur_mask(resized_image)
+
+    # Circle 마스크 생성
+    height, width = resized_image.shape[:2]
+    center = (width // 2, height // 2)
+    radius = int(min(width, height) * 0.46)
+    circle_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.circle(circle_mask, center, radius, 255, -1)
+
+    print(f'Fruit Color: {fruit_color}')  # 과실 색상 출력
+    print(f'Mean Hue (Fruit Mask): {mean_hue:.2f}')  # 평균 H 값 출력
+
+    disease_ratio = analyze_disease(contours_disease, fruit_mask, hsv_image)  # 병징 비율 계산
+    print(f'병징 면적 비율: {disease_ratio:.2f}%')  # 병징 면적 비율 출력
+
+    fig, axes = plt.subplots(2, 4, figsize=(22, 12))
+
+    axes[0, 0].imshow(cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB))
+    axes[0, 0].set_title("Original Image")
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(mask_hsv, cmap="gray")
+    axes[0, 1].set_title("HSV Filter Mask")
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(blur_mask, cmap="gray")
+    axes[0, 2].set_title("Blur Mask")
+    axes[0, 2].axis("off")
+
+    axes[0, 3].imshow(circle_mask, cmap="gray")
+    axes[0, 3].set_title("Circle Mask")
+    axes[0, 3].axis("off")
+
+    axes[1, 0].imshow(fruit_mask, cmap="gray")
+    axes[1, 0].set_title("Fruit Mask")
+    axes[1, 0].axis("off")
+
+    axes[1, 1].imshow(mask_h, cmap="gray")
+    axes[1, 1].set_title("H-Threshold Mask")
+    axes[1, 1].axis("off")
+
+    axes[1, 2].imshow(diff_mask, cmap="gray")
+    axes[1, 2].set_title("Diff Mask")
+    axes[1, 2].axis("off")
+
+    axes[1, 3].imshow(cv2.cvtColor(result_visualization, cv2.COLOR_BGR2RGB))
+    axes[1, 3].set_title("Result Visualization")
+    axes[1, 3].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+image_path = "/content/drive/MyDrive/leafs/bug/test3.JPG"
+main(image_path)
