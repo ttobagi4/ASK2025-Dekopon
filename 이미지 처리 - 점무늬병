@@ -1,0 +1,212 @@
+# (1) 이미지 전처리 - 크기 조정 & HSV 색 공간 변환, Blur 적용
+def preprocess_image(image_path) :
+    if not os.path.exists(image_path) :
+        raise FileNotFoundError(f"파일이 존재하지 않습니다.: {image_path}")
+
+    image = cv2.imread(image_path)
+    if image is None :
+        raise ValueError(f"이미지를 불러올 수 없습니다. 경로를 확인하세요!: {image_path}")
+
+    resized_image = cv2.resize(image, (512, 512))  # 크기 조정 (512x512)
+    hsv_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2HSV)
+    blurred_image = cv2.GaussianBlur(hsv_image, (5, 5), 0)  # 가우시안 블러 (노이즈 감소)
+
+    return resized_image, hsv_image, blurred_image
+
+# (2) Blur 기반 마스크 생성 - 흐린 부분(배경) 제거
+def create_blur_mask(image) :
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Laplacian of Gaussian : 흐린 부분 감지
+    gaussian = cv2.GaussianBlur(gray, (5, 5), 0)
+    laplacian = cv2.Laplacian(gaussian, cv2.CV_64F)
+    laplacian_abs = cv2.convertScaleAbs(laplacian)
+
+    # Otsu Threshold : 배경 자동 감지
+    _, blur_mask = cv2.threshold(laplacian_abs, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    return blur_mask
+
+# (3) 잎 영역 검출 - GrabCut 알고리즘 + HSV 필터링
+def detect_leaf_area(image, hsv_image) :
+
+    lower_green = np.array([20, 20, 20])
+    upper_green = np.array([100, 255, 255])
+    mask_leaf = cv2.inRange(hsv_image, lower_green, upper_green)
+
+    # Blur 마스크 : 흐린 부분 제거
+    blur_mask = create_blur_mask(image)
+    blur_mask = cv2.resize(blur_mask, (mask_leaf.shape[1], mask_leaf.shape[0]))
+    blur_mask = blur_mask.astype(np.uint8)
+
+    # Blur 마스크 + 기존 잎 마스크 -> 배경 제거
+    mask_leaf_combined = cv2.bitwise_and(mask_leaf, blur_mask)
+
+    grabcut_mask = np.zeros(image.shape[:2], np.uint8)
+    grabcut_mask[mask_leaf_combined > 0] = 1
+    grabcut_mask[mask_leaf_combined == 0] = 2
+    bgd_model = np.zeros((1, 65), np.float64)
+    fgd_model = np.zeros((1, 65), np.float64)
+    cv2.grabCut(image, grabcut_mask, None, bgd_model, fgd_model, iterCount=5, mode=cv2.GC_INIT_WITH_MASK)
+
+    # 최종 마스크
+    final_mask = np.where((grabcut_mask == 2) | (grabcut_mask == 0), 0, 1).astype("uint8")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask_leaf_cleaned = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask_leaf_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 가장 큰 윤곽 1개만 유지 (잎)
+    if contours :
+        contours = [max(contours, key=cv2.contourArea)]
+
+    # 디버깅용 시각화
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
+    axes[0].imshow(mask_leaf, cmap="gray")
+    axes[0].set_title("Initial Leaf Mask")
+    axes[0].axis("off")
+
+    axes[1].imshow(blur_mask, cmap="gray")
+    axes[1].set_title("Blur Mask (Focus-Based)")
+    axes[1].axis("off")
+
+    axes[2].imshow(mask_leaf_cleaned, cmap="gray")
+    axes[2].set_title("Final Leaf Mask (After Morphology)")
+    axes[2].axis("off")
+
+    final_visualization = image.copy()
+    cv2.drawContours(final_visualization, contours, -1, (0, 255, 0), 2)
+    axes[3].imshow(cv2.cvtColor(final_visualization, cv2.COLOR_BGR2RGB))
+    axes[3].set_title("Final Leaf Contour")
+    axes[3].axis("off")
+
+    plt.show()
+
+    return contours, mask_leaf_cleaned
+
+# (4) 점무늬병 검출 - HSV 색상 범위로 점무늬병 색상 탐지 -> 잎 내부 병징만 유지
+def detect_disease_area(hsv_image, leaf_contours) :
+
+    # 필터링 (두 개 필터 적용)
+    lower_spot1 = np.array([80, 0, 0])
+    upper_spot1 = np.array([179, 80, 175])
+
+    lower_spot2 = np.array([0, 0, 0])
+    upper_spot2 = np.array([43, 80, 160])
+
+    mask_disease1 = cv2.inRange(hsv_image, lower_spot1, upper_spot1)
+    mask_disease2 = cv2.inRange(hsv_image, lower_spot2, upper_spot2)
+
+    # 두 개 필터 마스크 병합
+    mask_disease = cv2.bitwise_or(mask_disease1, mask_disease2)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask_disease_cleaned = cv2.morphologyEx(mask_disease, cv2.MORPH_CLOSE, kernel)
+    mask_disease_cleaned = cv2.GaussianBlur(mask_disease_cleaned, (3, 3), 0)
+
+    contours_disease, _ = cv2.findContours(mask_disease_cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # 잎 내부 병징 유지
+    valid_disease_contours = []
+    for disease_contour in contours_disease :
+        new_contour = []
+        for point in disease_contour[:, 0, :] :
+            point_tuple = tuple(map(int, point))
+            inside_any_leaf = any(
+                cv2.pointPolygonTest(leaf_contour, point_tuple, False) >= 0 for leaf_contour in leaf_contours
+            )
+
+            if inside_any_leaf :
+                new_contour.append(point_tuple)
+            else :
+                closest_leaf_point = None
+                min_distance = float('inf')
+
+                for leaf_contour in leaf_contours :
+                    for leaf_point in leaf_contour[:, 0, :] :
+                        leaf_point_tuple = tuple(map(int, leaf_point))
+                        distance = np.linalg.norm(np.array(point_tuple) - np.array(leaf_point_tuple))
+
+                        if distance < min_distance :
+                            min_distance = distance
+                            closest_leaf_point = leaf_point_tuple
+
+                if closest_leaf_point :
+                    new_contour.append(closest_leaf_point)
+
+        if len(new_contour) > 2 :  # 최소한 3개 이상의 점이 있어야 윤곽선 유지 가능하게
+            new_contour = np.array(new_contour, dtype=np.int32).reshape((-1, 1, 2))
+            valid_disease_contours.append(new_contour)
+
+    return valid_disease_contours, mask_disease_cleaned
+
+# (5) 병징 분석 - 면적 비율 계산
+def analyze_disease(contours_disease_all, leaf_area_mask, hsv_image) :
+
+    # 전체 잎 면적 계산
+    leaf_area = np.sum(leaf_area_mask > 0)
+    if leaf_area == 0:
+        return None  # 잎이 검출되지 않은 경우
+
+    mask_disease_contours = np.zeros_like(leaf_area_mask, dtype=np.uint8)
+    cv2.drawContours(mask_disease_contours, contours_disease_all, -1, (255), thickness=cv2.FILLED)
+
+    # 면적 비율 계산
+    total_disease_pixels = np.sum(mask_disease_contours > 0)
+    if total_disease_pixels == 0 :
+        return 0  # 병징이 없는 경우
+
+    disease_ratio = (total_disease_pixels / leaf_area) * 100
+
+    return disease_ratio
+
+# (6) 결과 시각화
+def visualize_results(image, contours_leaf_all, contours_disease) :
+    result_image = image.copy()
+
+    # 잎 윤곽선 (초록색)
+    for contour in contours_leaf_all :
+        cv2.drawContours(result_image, [contour], -1, (0, 255, 0), thickness=3)
+
+    # 병징 윤곽선 (빨간색)
+    for contour in contours_disease :
+        cv2.drawContours(result_image, [contour], -1, (0, 0, 255), thickness=3)
+
+    return result_image
+
+# (7) 실행
+def main(image_path) :
+    resized_image, hsv_image, _ = preprocess_image(image_path)
+
+    contours_leaf_all, leaf_mask_cleaned = detect_leaf_area(resized_image, hsv_image)
+    contours_disease_all, disease_mask_cleaned = detect_disease_area(hsv_image, contours_leaf_all)
+
+    disease_ratio, severity_level = analyze_disease(contours_disease_all, leaf_mask_cleaned, hsv_image)
+
+    result_visualization = visualize_results(resized_image, contours_leaf_all, contours_disease_all)
+
+    print(f" 병징 분석 결과:")
+    print(f" - 전체 병징 면적 비율: {disease_ratio:.2f}%")
+
+    # Colab에서 이미지 출력
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB))
+    axes[0].set_title("Original Image")
+    axes[0].axis("off")
+
+    axes[1].imshow(disease_mask_cleaned, cmap="gray")
+    axes[1].set_title("Disease Mask")
+    axes[1].axis("off")
+
+    axes[2].imshow(cv2.cvtColor(result_visualization, cv2.COLOR_BGR2RGB))
+    axes[2].set_title("Result Visualization")
+    axes[2].axis("off")
+
+    plt.show()
+
+# 실행: Faster R-CNN이 잘라낸 단일 이미지 경로 넣기
+image_path = "/content/drive/MyDrive/leafs/spotting/test3.JPG"
+main(image_path)
